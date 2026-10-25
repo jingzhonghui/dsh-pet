@@ -76,6 +76,14 @@ export function frameToToast(frame: NotifyFrame): { title: string; body: string;
         icon: NOTIFY_ICONS.error,
       };
     }
+    case 'host/auto-continue': {
+      // 自动续跑的状态反馈（已发起 / 达到次数上限 / 熔断暂停）：不是错误，但用同一套提示通道。
+      return {
+        title: '自动续跑',
+        body: typeof frame.message === 'string' ? (frame.message as string) : '',
+        icon: NOTIFY_ICONS.error,
+      };
+    }
     default:
       return null;
   }

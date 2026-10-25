@@ -30,6 +30,10 @@ export const defaultHelperMain = resolve(packageRoot, 'runtime', 'electron-helpe
 /** 协议行前缀：stdout/stdin 里以此开头的整行 JSON 属于 bridge 协议，其余为日志。 */
 export const BRIDGE_PREFIX = 'dsh-pet-bridge:';
 
+/** Helper → 宿主的控制行前缀：启动时上报本地回调地址（中断弹框控制端点由它推导）。
+ *  没有它时，只有「有宠物窗口在轮询」才会带来第一份 cb；纯托盘常驻永远拿不到。 */
+export const CONTROL_PREFIX = 'dsh-pet-control:';
+
 /** 渲染端（经 main.js 转发）的一次请求：URL 是 /dsh-pet-7340/... 路径 + 查询串；
  *  cb = main.js 本地回调服务器地址（宿主把应答 POST 回去；Electron 主进程读不到 piped stdin，
  *  故应答不走 0 号管道 —— electron#4218） */
@@ -328,6 +332,9 @@ export class HelperProcess {
   declare private lastStartAt: number;
   /** stdout 按行缓冲（协议行按 \n 切分）。用 declare + 构造器赋值，避免类字段降级出外部 helper */
   declare private stdoutBuffer: string;
+  /** 最近一次 bridge 请求携带的本地回调地址（`http://127.0.0.1:<port>/respond`）。
+   *  中断弹框走同一台本地 HTTP 服务器的 `/interrupt` 端点：宿主直接 POST，不依赖渲染端轮询。 */
+  declare private lastCallbackUrl: string;
 
   constructor(options: HelperOptions = {}, logger: Logger = console) {
     this.options = options;
@@ -338,6 +345,7 @@ export class HelperProcess {
     this.restartFailures = 0;
     this.lastStartAt = 0;
     this.stdoutBuffer = '';
+    this.lastCallbackUrl = '';
   }
 
   /** 拉起子进程；已有子进程在跑或正在停止时直接返回现有句柄。 */
@@ -412,7 +420,23 @@ export class HelperProcess {
         void this.handleBridgeLine(trimmed);
         continue;
       }
+      if (trimmed.startsWith(CONTROL_PREFIX)) {
+        this.handleControlLine(trimmed);
+        continue;
+      }
       this.logger.debug?.(`[dsh-pet desktop helper] ${trimmed}`);
+    }
+  }
+
+  /** 处理一条控制行：目前只有「helper 启动后上报回调地址」这一种。 */
+  private handleControlLine(line: string): void {
+    try {
+      const msg = JSON.parse(line.slice(CONTROL_PREFIX.length)) as { kind?: unknown; callback?: unknown };
+      if (msg.kind === 'bridge' && typeof msg.callback === 'string' && /^https?:[/][/]/.test(msg.callback)) {
+        this.lastCallbackUrl = msg.callback;
+      }
+    } catch {
+      this.logger.warn?.('[dsh-pet desktop helper] control 协议行非法，已忽略');
     }
   }
 
@@ -429,6 +453,7 @@ export class HelperProcess {
       return;
     }
     if (typeof req.id !== 'number') return;
+    if (typeof req.cb === 'string' && /^https?:[/][/]/.test(req.cb)) this.lastCallbackUrl = req.cb;
     try {
       // bridgeHandler 返回完整 BridgeResponse（含 id）；异常时兜底 500
       const resp = await this.options.bridgeHandler(req);
@@ -463,6 +488,48 @@ export class HelperProcess {
     } catch {
       /* ignore */
     }
+  }
+
+  /** 桌面 Helper 的中断弹框控制端点（由 bridge 回调地址推导）。没有活着的 Helper / 还没收到过
+   *  回调地址时返回 undefined——调用方据此回退到网页内确认卡。 */
+  interruptControlUrl(): string | undefined {
+    if (!this.child || !this.lastCallbackUrl) return undefined;
+    try {
+      return `${new URL(this.lastCallbackUrl).origin}/interrupt`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** 让桌面 Helper 弹中断确认框；false = 当前没有可用的 Helper（调用方应回退）。
+   *  fire-and-forget：宿主不等用户回答，答案经 bridge 协议回到 /interrupt/answer 路由。 */
+  notifyInterrupt(payload: unknown): boolean {
+    const url = this.interruptControlUrl();
+    if (!url) return false;
+    void fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).catch((e: unknown) => {
+      this.logger.warn?.(
+        `[dsh-pet desktop helper] interrupt notify failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    });
+    return true;
+  }
+
+  /** 让桌面 Helper 收起中断确认框（被网页回答 / 宿主超时 / 用户发了新消息时）。
+   *  只能按 id 关：桌面端可能已经换成了另一条待确认项，不能误关。 */
+  dismissInterrupt(id: string): void {
+    const base = this.interruptControlUrl();
+    if (!base || !id) return;
+    void fetch(`${base}/dismiss`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id }),
+    }).catch(() => {
+      /* Helper 已退出：窗口随之销毁，不需要补救 */
+    });
   }
 
   /** 停止 helper：发 SIGTERM 即返回，不等它退出。宿主退出 / 插件卸载路径用它——宿主马上就没了

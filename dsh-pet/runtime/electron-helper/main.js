@@ -22,8 +22,7 @@ try {
   );
   process.exit(3);
 }
-const { app, BrowserWindow, ipcMain, screen, shell, protocol, Tray, Menu, nativeImage, powerMonitor } =
-  electronApi;
+const { app, BrowserWindow, ipcMain, screen, shell, protocol, Tray, Menu, nativeImage, powerMonitor } = electronApi;
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { readFileSync, writeFileSync } = require('node:fs');
@@ -563,11 +562,294 @@ function bridgeResolve(resp) {
   p.resolve(resp);
 }
 
+// 异常中断确认气泡：单例，宿主经本地回调服务器的 POST /interrupt 触发。
+// 形态与宠物头顶的气泡同源（白色半透明圆泡 + 下指尾巴 + 上首软糖体，见 interrupt.html）：窗口本身
+// 透明、无边框，只让气泡可见。窗口要点仍与宠物窗不同——必须抢焦点、进任务栏、置顶到 screen-saver
+// 级，需求是「不管当前激活的窗口是不是 DSH 都要弹出来」。答案经 bridge 协议回宿主
+// /interrupt/answer，不依赖渲染端轮询。
+// 尺寸不写死：页面按内容量出气泡大小后经 pet:interrupt-measure 上报，主进程把窗口收到刚好包住气泡
+// （左右留投影、底部留尾巴）。长文案不会被裁，短文案也不会拖出一个大透明框。
+let interruptWindow = null;
+let interruptPayload = null;
+let interruptTimer = null;
+let interruptAnswered = false;
+/** 气泡窗外框尺寸（CSS px）；null = 页面还没量出来，先按兜底尺寸占位 */
+let interruptSize = null;
+/** 是否已经 show 过：首帧尺寸就位才显示，避免先看到空窗再缩一下 */
+let interruptRevealed = false;
+/** 本次气泡跟随的锚点宠物窗（跟随移动用它，不能每次重挑最近的） */
+let interruptAnchor = null;
+/** 跟随锚点宠物窗的 move/resize 监听清理函数。 */
+let interruptUnfollow = null;
+/** 页面首帧尺寸上报前的占位尺寸；正常路径下这条兜底永远看不到 */
+const INTERRUPT_FALLBACK_SIZE = { width: 300, height: 150 };
+/** 气泡窗尺寸上下限：太窄读不了、太宽就不再像气泡；高度留足 4 行原因 + 2 行任务 + 按钮 */
+const INTERRUPT_MIN_W = 200;
+const INTERRUPT_MAX_W = 420;
+const INTERRUPT_MIN_H = 110;
+const INTERRUPT_MAX_H = 620;
+/** 尾巴尖与宠物头顶之间的空隙：气泡贴着脑袋，但不压住宠物 */
+const INTERRUPT_TAIL_GAP = 4;
+
+function clearInterruptTimer() {
+  if (interruptTimer !== null) {
+    clearTimeout(interruptTimer);
+    interruptTimer = null;
+  }
+}
+
+function destroyInterruptWindow() {
+  clearInterruptTimer();
+  if (interruptUnfollow) {
+    const unfollow = interruptUnfollow;
+    interruptUnfollow = null;
+    unfollow();
+  }
+  const win = interruptWindow;
+  interruptWindow = null;
+  // 尺寸/显示/锚点都属于「这一条气泡」：随窗一起作废，下一条从兜底尺寸重新量
+  interruptSize = null;
+  interruptRevealed = false;
+  interruptAnchor = null;
+  if (win && !win.isDestroyed()) win.destroy();
+}
+
+/** 选离光标最近的可见宠物窗作锚点；没有宠物窗（托盘模式）返回 null。 */
+function pickInterruptAnchor() {
+  const point = screen.getCursorScreenPoint();
+  let best = null;
+  let bestDistance = Infinity;
+  for (const win of windows.values()) {
+    if (!win || win.isDestroyed() || !win.isVisible()) continue;
+    const b = win.getBounds();
+    if (b.width < 8 || b.height < 8) continue;
+    const dx = b.x + b.width / 2 - point.x;
+    const dy = b.y + b.height / 2 - point.y;
+    const distance = dx * dx + dy * dy;
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = win;
+    }
+  }
+  return best;
+}
+
+/**
+ * 确认气泡位置：窗口底边（即尾巴尖）贴在宠物头顶上方 INTERRUPT_TAIL_GAP，水平对齐宠物中心，
+ * 并夹在当前显示器工作区内。
+ *
+ * 头顶 y 优先用渲染端上报的 `winMargins.marginT`（窗口顶 → 宠物包围盒顶）；
+ * 渲染端首帧前没有该值，才回退到宠物窗宽的近似口径（外扩 ≈ 窗口宽 / 4）。
+ */
+function interruptPlacement(petWin, width, height) {
+  if (!petWin || petWin.isDestroyed()) return null;
+  const b = petWin.getBounds();
+  if (b.width < 8 || b.height < 8) return null;
+  const margins = winMargins.get(petWin.id);
+  const marginTop = margins && Number.isFinite(margins.t) ? margins.t : Math.round(b.width / 4);
+  const headY = b.y + marginTop;
+  const centerX = b.x + b.width / 2;
+  const area = screen.getDisplayNearestPoint({ x: Math.round(centerX), y: Math.round(headY) }).workArea;
+  const maxX = Math.max(area.x + 8, area.x + area.width - width - 8);
+  const x = Math.min(Math.max(Math.round(centerX - width / 2), area.x + 8), maxX);
+  // 头顶空间不足（宠物贴屏幕顶）时贴屏顶：宁可轻微压住宠物，也不能把气泡推到屏幕外。
+  const y = Math.max(Math.round(headY - height - INTERRUPT_TAIL_GAP), area.y + 8);
+  return { x, y };
+}
+
+/** 没有宠物窗（托盘模式）时的兜底位置：光标所在屏的工作区居中。 */
+function centeredInterruptPlacement(width, height) {
+  const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+  return {
+    x: Math.round(area.x + (area.width - width) / 2),
+    y: Math.round(area.y + (area.height - height) / 2),
+  };
+}
+
+/**
+ * 按当前气泡尺寸与锚点宠物重新落位并收口窗口大小。
+ * 尺寸变化、宠物移动/缩放都走这里，保证「尾巴尖始终对着脑袋、底边始终在头顶上方」。
+ */
+function applyInterruptBounds() {
+  const win = interruptWindow;
+  if (!win || win.isDestroyed()) return;
+  const size = interruptSize || INTERRUPT_FALLBACK_SIZE;
+  const anchor = interruptAnchor && !interruptAnchor.isDestroyed() ? interruptAnchor : null;
+  const placement =
+    (anchor && interruptPlacement(anchor, size.width, size.height)) ||
+    centeredInterruptPlacement(size.width, size.height);
+  win.setBounds({ x: placement.x, y: placement.y, width: size.width, height: size.height });
+}
+
+/**
+ * 显示气泡窗：只在第一次显示时抢焦点，尺寸变化时重设 bounds 不重复抢焦点。
+ *
+ * 不调 flashFrame：桌宠的所有气泡（碎碎念、对话）都不占任务栏、也不闪任务栏，这条要一致——
+ * 闪的是一个不存在的按钮，既没用又会在某些 Shell 状态下把窗口重新拉回任务栏。
+ */
+function revealInterrupt() {
+  const win = interruptWindow;
+  if (!win || win.isDestroyed() || interruptRevealed) return;
+  interruptRevealed = true;
+  win.show();
+  win.focus();
+  // 气泡尺寸异常（被裁、留白过大）时最缺的就是这两个数：上报的是什么、窗口实际收到的是什么。
+  // 一次弹框只记一行，不影响日常日志。
+  const content = win.getContentSize();
+  const size = interruptSize || INTERRUPT_FALLBACK_SIZE;
+  if (content[0] !== size.width || content[1] !== size.height) {
+    console.error(
+      `[dsh-pet-desktop-helper] interrupt bubble ${size.width}x${size.height}, content ${content[0]}x${content[1]}`,
+    );
+  }
+}
+
+/** 宿主回答/超时/用户发新消息后收起确认窗：只按 id 关，避免误关新的一条。 */
+function dismissInterrupt(id) {
+  if (!interruptPayload) return;
+  if (id && interruptPayload.id !== id) return;
+  // 先置 answered 再销毁：closed 处理器不会再把「关窗」当成一次 no 回给宿主。
+  interruptAnswered = true;
+  interruptPayload = null;
+  destroyInterruptWindow();
+}
+
+/** 结束当前确认：先摘状态再销毁窗口，避免 closed 处理器把同一个回答发两遍。 */
+function finishInterrupt(answer, reason) {
+  const payload = interruptPayload;
+  if (!payload || interruptAnswered) return;
+  interruptAnswered = true;
+  interruptPayload = null;
+  destroyInterruptWindow();
+  void bridgeRequest(
+    'POST',
+    '/dsh-pet-7340/interrupt/answer',
+    JSON.stringify({ id: payload.id, answer: answer ? 'continue' : 'no', reason }),
+  ).catch((e) => {
+    console.error('[dsh-pet-desktop-helper] interrupt answer failed:', String(e && e.message ? e.message : e));
+  });
+}
+
+/** 显示确认气泡；后到的 payload 直接替换前一条（宿主侧也只保留一条待确认项）。 */
+function showInterrupt(payload) {
+  if (!payload || typeof payload !== 'object' || typeof payload.id !== 'string' || !payload.id) return;
+  // 旧窗只销毁、不回答案：它的 id 已经被宿主的新待确认项取代，回 no 会误伤。
+  interruptAnswered = true;
+  destroyInterruptWindow();
+  interruptPayload = payload;
+  interruptAnswered = false;
+  interruptSize = null; // 新内容要重新量尺寸
+  interruptRevealed = false;
+  interruptAnchor = pickInterruptAnchor();
+
+  const win = new BrowserWindow({
+    width: INTERRUPT_FALLBACK_SIZE.width,
+    height: INTERRUPT_FALLBACK_SIZE.height,
+    frame: false,
+    // 透明窗：桌面上只看得到气泡本身（白色圆泡 + 尾巴），没有深色底框
+    transparent: true,
+    backgroundColor: '#00000000',
+    hasShadow: false,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    show: false,
+    alwaysOnTop: true,
+    // 不占任务栏：桌宠的碎碎念/对话气泡都长在宠物窗里、从不进任务栏，这条一旦进任务栏，
+    // 每次中断都会多一个图标（用户第一眼就当成「弹了个窗口」而不是「宠物头顶说话」）。
+    skipTaskbar: true,
+    useContentSize: true,
+    title: 'dsh-pet 中断确认',
+    webPreferences: {
+      preload: path.join(__dirname, 'interrupt-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      backgroundThrottling: false,
+    },
+  });
+  interruptWindow = win;
+  // 先按兜底尺寸贴到头顶，等页面量出真实尺寸后由 pet:interrupt-measure 收口
+  applyInterruptBounds();
+  // 宠物移动 / 缩放时气泡跟着走，像气泡一样始终贴在头顶。
+  const anchor = interruptAnchor;
+  if (anchor && !anchor.isDestroyed()) {
+    const follow = () => applyInterruptBounds();
+    anchor.on('move', follow);
+    anchor.on('resize', follow);
+    interruptUnfollow = () => {
+      if (!anchor.isDestroyed()) {
+        anchor.removeListener('move', follow);
+        anchor.removeListener('resize', follow);
+      }
+      interruptUnfollow = null;
+    };
+  }
+  // screen-saver 级：普通置顶会被全屏应用/其他置顶窗盖住，这里按需求强行提到最上层。
+  win.setAlwaysOnTop(true, 'screen-saver');
+  try {
+    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  } catch {
+    /* 平台不支持：忽略 */
+  }
+  win.webContents.once('dom-ready', () => {
+    if (win.isDestroyed()) return;
+    win.webContents.send('interrupt:data', payload);
+  });
+  // 冷启动 / 磁盘慢时 dom-ready 可能迟到好几秒，窗口一直 show:false 就等于没弹：
+  // 1.2s 后无论有没有量到尺寸都先显示（气泡自己会随内容长高，尺寸随后仍会收口）。
+  const revealTimer = setTimeout(revealInterrupt, 1200);
+  revealTimer.unref?.();
+  win.on('closed', () => {
+    clearTimeout(revealTimer);
+    if (interruptWindow === win) interruptWindow = null;
+    // 用户直接关窗（Alt+F4 / 点关闭）＝ 暂不继续；finish 内部有 answered 守卫，不会重入。
+    if (!interruptAnswered) finishInterrupt(false, 'dismissed');
+  });
+  win.loadFile(path.join(__dirname, 'interrupt.html')).catch((e) => {
+    console.error('[dsh-pet-desktop-helper] interrupt page load failed:', String(e && e.message ? e.message : e));
+    finishInterrupt(false, 'load-failed');
+  });
+
+  const timeoutMs = Number(payload.timeoutMs);
+  interruptTimer = setTimeout(
+    () => finishInterrupt(false, 'timeout'),
+    Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 90000,
+  );
+  interruptTimer.unref?.();
+}
+
+// 气泡页面量出的尺寸：窗口收到刚好包住气泡（Clamp 防手改 payload 把窗口撑爆屏）。
+ipcMain.on('pet:interrupt-measure', (event, size) => {
+  if (!interruptWindow || event.sender !== interruptWindow.webContents) return;
+  const rawW = Math.ceil(Number(size && size.w));
+  const rawH = Math.ceil(Number(size && size.h));
+  if (!(rawW > 0) || !(rawH > 0)) return;
+  const width = Math.min(INTERRUPT_MAX_W, Math.max(INTERRUPT_MIN_W, rawW));
+  const height = Math.min(INTERRUPT_MAX_H, Math.max(INTERRUPT_MIN_H, rawH));
+  if (!interruptSize || interruptSize.width !== width || interruptSize.height !== height) {
+    interruptSize = { width, height };
+    applyInterruptBounds();
+  }
+  // 尺寸就位后才显示：先显示空窗再缩一下，视觉上是「闪一下」。
+  revealInterrupt();
+});
+
+// 确认气泡的按钮/回车：只接受当前确认窗发来的答案。
+ipcMain.on('pet:interrupt-answer', (event, message) => {
+  if (!interruptWindow || event.sender !== interruptWindow.webContents) return;
+  finishInterrupt(message && message.answer === 'continue', 'user');
+});
+
 /** 本地回调服务器：宿主把应答 POST 到这里（127.0.0.1 随机端口，绕开 stdin/DSH 闸门） */
 function startBridgeCallback() {
   const http = require('node:http');
   const server = http.createServer((req, res) => {
-    if (req.method !== 'POST' || req.url !== '/respond') {
+    if (
+      req.method !== 'POST' ||
+      (req.url !== '/respond' && req.url !== '/interrupt' && req.url !== '/interrupt/dismiss')
+    ) {
       res.writeHead(404, { 'content-type': 'text/plain' });
       res.end('dsh-pet: not found');
       return;
@@ -575,6 +857,31 @@ function startBridgeCallback() {
     let raw = '';
     req.on('data', (c) => (raw += c));
     req.on('end', () => {
+      if (req.url === '/interrupt') {
+        try {
+          const payload = JSON.parse(raw);
+          res.writeHead(200, { 'content-type': 'text/plain' });
+          res.end('ok');
+          // 先回执再建窗：宿主是 fire-and-forget，不该等窗口就绪。
+          setImmediate(() => showInterrupt(payload));
+        } catch {
+          res.writeHead(400, { 'content-type': 'text/plain' });
+          res.end('dsh-pet: bad payload');
+        }
+        return;
+      }
+      if (req.url === '/interrupt/dismiss') {
+        let id = '';
+        try {
+          id = String(JSON.parse(raw || '{}').id || '');
+        } catch {
+          /* 空 id = 关掉当前窗 */
+        }
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end('ok');
+        setImmediate(() => dismissInterrupt(id));
+        return;
+      }
       try {
         bridgeResolve(JSON.parse(raw));
         res.writeHead(200, { 'content-type': 'text/plain' });
@@ -596,6 +903,13 @@ function startBridgeCallback() {
     const addr = server.address();
     bridgeCallbackUrl = 'http://127.0.0.1:' + (addr && typeof addr === 'object' ? addr.port : 0) + '/respond';
     console.error('[dsh-pet-desktop-helper] bridge callback: ' + bridgeCallbackUrl);
+    // 主动上报回调地址：没有宠物窗口时渲染端不会发任何 bridge 请求，宿主就永远拿不到 cb，
+    // 中断弹框会退化成网页卡片。控制行让宿主在启动阶段就知道 /interrupt 往哪 POST。
+    try {
+      process.stdout.write('dsh-pet-control:' + JSON.stringify({ kind: 'bridge', callback: bridgeCallbackUrl }) + '\n');
+    } catch {
+      /* stdout 不可写：退化为等第一条 bridge 请求携带 cb */
+    }
   });
   return server;
 }

@@ -19,6 +19,7 @@ dsh-pet 的宿主半侧向 DSH 自己的 Web 服务注册了**一条前缀路由
 | `GET /dsh-pet-7340/models` | 可用服务商与模型清单（与 DSH 自己的模型选择器同源） |
 | `GET /dsh-pet-7340/chat?pet=` | 读某只桌宠最近的对话记忆窗口；带 `?rounds=` 可指定本次读取的轮数（0–200，不传用配置的 `chatMemoryRounds`） |
 | `GET /dsh-pet-7340/pose?pet=` | 读**桌面端**宠物的实况（位置 + 朝向）；网页端用客户端服务 `petApi7340`，不走这条路 |
+| `GET /dsh-pet-7340/interrupt/status` | 读当前「异常中断是否继续」待确认项与续跑配置快照（只读，不触发续跑） |
 
 ## 二、占用锁
 
@@ -81,7 +82,27 @@ dsh-pet 的宿主半侧向 DSH 自己的 Web 服务注册了**一条前缀路由
 
 第三方菜单项统一收在右键菜单的**「更多」**下；只有一项时不显示 `owner` 那层。
 
-## 七、素材
+## 七、异常中断续跑
+
+服务商/网络异常导致回合中断、且工作可能未完成时，宿主会先分类：只有 429 / 5xx / 超时 / 连接重置
+等**可重试**中断才进入续跑流程；认证失败、请求非法、内容过滤一律不续。
+
+| 接口 | 功能 |
+| --- | --- |
+| `POST /dsh-pet-7340/interrupt/answer` | 回答确认：`{ id, answer: "continue" \| "no" }`；桌面弹框与网页卡片共用 |
+| `POST /dsh-pet-7340/interrupt/test` | 弹一次测试确认框（回答不会真的续跑），验证 Helper 是否常驻 |
+
+行为要点：
+
+- **默认（`autoContinueEnabled: false`）**：由常驻桌面 Helper 弹出置顶确认框，点了「继续」才续跑；
+  桌面 Helper 不可用时回退为网页内确认卡。**绝不无确认自动续跑。**
+- **开启后**：回合结束后延迟 `autoContinueDelayMs` 直接续跑，不再弹框；连续失败按 2 倍退避（上限 120s），延迟期间用户发消息会取消。
+- 同一会话最多 `autoContinueMaxAttempts` 次；10 分钟内超过 5 次会熔断暂停 10 分钟。
+- `interrupted`（崩溃恢复）每次启动最多自动续一次；`max-tokens` 默认不续（`autoContinueOnTruncated` 显式开）。
+- 续跑消息以一条「自动续跑」来源的用户消息出现在会话里，仍受 DSH 权限与工具审批约束；
+  有进行中且 armed 的目标时让位给 `goal-round-driver`，避免双重续跑。
+
+## 八、素材
 
 | 接口 | 功能 |
 | --- | --- |
@@ -89,7 +110,7 @@ dsh-pet 的宿主半侧向 DSH 自己的 Web 服务注册了**一条前缀路由
 | `GET /dsh-pet-7340/font/{file}` | 字体文件 |
 | `GET /dsh-pet-7340/pic/{file}` | 通知图标（`pic/`）与表情包（`pic/memes/{素材根}/`，按宠物归属） |
 
-## 八、工作状态（外部写入）
+## 九、工作状态（外部写入）
 
 | 接口 | 功能 |
 | --- | --- |
@@ -106,7 +127,7 @@ dsh-pet 的宿主半侧向 DSH 自己的 Web 服务注册了**一条前缀路由
 {
   "counter": 1755000000007,   // 整份 S 的版本号 = 最后一次写入的编号（顶层，不是叶子）
   "sections": {               // 全局段：所有端共享一份
-    "balance": {…}, "workStatus": {…}, "notify": {…}, "config": {…}
+    "balance": {…}, "workStatus": {…}, "notify": {…}, "config": {…}, "interrupt": {…}
   },
   "pets": {                   // 每只宠物各自一份；键是宠物 id（可含点号，勿切分）
     "main": { "say": {…}, "anim": {…}, "position": {…}, "throw": {…}, "lock": {…} }

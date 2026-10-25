@@ -65,6 +65,13 @@ import {
   type HostWorkStatusState,
   type WorkStatusTurnContext,
 } from './work-status';
+import {
+  AutoContinueStore,
+  continuationPrompt,
+  type AutoContinueConfig,
+  type ContinueRequest,
+  type TurnEndReason,
+} from './auto-continue';
 import { toolDetailFromEvent } from './tool-detail';
 import {
   agentErrorFrame,
@@ -516,6 +523,13 @@ export function apply(ctx: any): void {
    */
   const lastTodoText = new Map<string, string | null>();
   /**
+   * 每会话清单里还有没有没做完的项（in_progress/pending）。
+   *
+   * 只给「completed 也要纳入」用：DSH 对「模型说了句话就停」和「真收尾」都给 completed，
+   * 光看 reason 分不出来；清单没清空说明活没干完，才算可疑。清单全绿/没写过清单 → false。
+   */
+  const openTodo = new Map<string, boolean>();
+  /**
    * 每会话「正在跑、且气泡上有具体描述」的工具数（不是布尔）：并行调用时先返回的那个不该把
    * 仍在中途的另一个描述顶掉。只统计拿到了目标的调用——没写出描述就不该占位。
    */
@@ -923,6 +937,93 @@ export function apply(ctx: any): void {
    */
   const inProcessHost = process.env.DSH_PET_IN_PROCESS === '1';
 
+  /** 异常中断自动续跑：读 main 配置并夹取到合法区间（readAllConfig 已填默认值，这里只兜底手改值）。 */
+  const readAutoConfig = (): AutoContinueConfig => {
+    const clampInt = (value: unknown, fallback: number, min: number, max: number): number => {
+      const n = Number(value);
+      return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
+    };
+    const fallback: AutoContinueConfig = {
+      enabled: false,
+      maxAttempts: 3,
+      delayMs: 5000,
+      dialogTimeoutMs: 90_000,
+      allowTruncated: false,
+      allowCompleted: true,
+    };
+    try {
+      const main = (readAllConfig(configPaths).main ?? {}) as Record<string, unknown>;
+      return {
+        enabled: main.autoContinueEnabled === true,
+        maxAttempts: clampInt(main.autoContinueMaxAttempts, 3, 1, 10),
+        delayMs: clampInt(main.autoContinueDelayMs, 5000, 1000, 120_000),
+        dialogTimeoutMs: clampInt(main.autoContinueDialogTimeoutMs, 90_000, 10_000, 600_000),
+        allowTruncated: main.autoContinueOnTruncated === true,
+        // 默认开：老配置没有这个键时按「纳入」处理，行为与设置页开关初值一致。
+        allowCompleted: main.autoContinueOnCompleted !== false,
+      };
+    } catch {
+      return fallback;
+    }
+  };
+
+  /** DSH 的 Agent 服务（ctx.agents）；只用到 get + followup，形状按最小契约声明。 */
+  type FollowupAgent = {
+    followup?: (input: {
+      content: Array<{ type: 'text'; text: string }>;
+      source: { kind: string };
+    }) => Promise<unknown>;
+  };
+  type AgentsService = { get?: (sessionId: string) => FollowupAgent | undefined };
+  type GoalsService = { get?: (agent: FollowupAgent) => { phase?: string; activation?: string } | undefined };
+
+  /** 真正续跑：只对还活着的会话发 followup；会话已关闭 / 服务不可用返回 false。 */
+  const continueSession = async ({ sessionId, payload }: ContinueRequest): Promise<boolean> => {
+    if (!sessionId || sessionId === 'unknown') return false;
+    const services = ctx as unknown as {
+      agents?: AgentsService;
+      goals?: GoalsService;
+      get?: (name: string) => unknown;
+    };
+    const agents = services.agents ?? (services.get?.('agents') as AgentsService | undefined);
+    const agent = agents?.get?.(sessionId);
+    if (!agent || typeof agent.followup !== 'function') return false;
+    // armed goal：DSH 的 goal-round-driver 自己会续跑，别双重续跑（一期直接让位）。
+    try {
+      const goals = services.goals ?? (services.get?.('goals') as GoalsService | undefined);
+      const goal = goals?.get?.(agent);
+      if (goal?.phase === 'active' && goal.activation === 'armed') {
+        pushNotifyFrame({ type: 'host/auto-continue', message: '该会话有进行中的目标，已交给目标续跑处理。' });
+        return false;
+      }
+    } catch {
+      /* goal 服务不可用：继续走普通续跑 */
+    }
+    try {
+      await agent.followup({
+        content: [{ type: 'text', text: continuationPrompt(payload.task, payload.kind) }],
+        source: { kind: 'auto-continue' },
+      });
+      return true;
+    } catch (e) {
+      ctx.logger?.warn?.(`[dsh-pet] auto-continue followup failed: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
+  };
+
+  const autoContinue = new AutoContinueStore(
+    {
+      publish: (payload) => state.writeSection('interrupt', payload),
+      // 常驻 Helper 可用时由它弹置顶确认框；不可用则回落到网页内卡片（via='web'）。
+      askDesktop: (payload) => helper?.notifyInterrupt(payload) === true,
+      dismissDesktop: (id) => helper?.dismissInterrupt(id),
+      continueSession,
+      notify: (message) => pushNotifyFrame({ type: 'host/auto-continue', message }),
+    },
+    readAutoConfig(),
+  );
+  ctx.effect(() => () => autoContinue.dispose(), 'dsh-pet: auto-continue store');
+
   /** 用已确认存在的 Electron 路径拉起桌面 Helper（每只桌面宠物一个局部小窗口）。 */
   const launchHelper = (electronPath: string | undefined): void => {
     if (inProcessHost) return; // 应用模式：窗口由本进程建，绝不 spawn
@@ -1161,6 +1262,39 @@ export function apply(ctx: any): void {
     body?: string,
     signal?: AbortSignal,
   ): Promise<RouteResult> => {
+    // 异常中断确认：桌面 Helper 弹框 / 网页内卡片共用同一个回答入口。
+    // 业务失败一律 200 + {ok:false, reason}（与其他动作端点同口径），避免调用方当成传输层故障。
+    if (rest === 'interrupt/answer') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      let payload: { id?: unknown; answer?: unknown };
+      try {
+        payload = JSON.parse(body ?? '') as { id?: unknown; answer?: unknown };
+      } catch {
+        return { kind: 'json', status: 400, obj: { error: 'invalid JSON body' } };
+      }
+      const id = typeof payload.id === 'string' ? payload.id : '';
+      const answer = payload.answer === true || payload.answer === 'continue' || payload.answer === 'yes';
+      if (!id) return { kind: 'json', status: 200, obj: { ok: false, reason: 'missing-id' } };
+      const accepted = autoContinue.answer(id, answer);
+      return {
+        kind: 'json',
+        status: 200,
+        obj: { ok: accepted, reason: accepted ? undefined : 'stale-or-unknown' },
+      };
+    }
+    if (rest === 'interrupt/status') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      return {
+        kind: 'json',
+        status: 200,
+        obj: { ok: true, pending: autoContinue.pendingInterrupt(), config: readAutoConfig() },
+        headers: { 'cache-control': 'no-cache, no-store' },
+      };
+    }
+    if (rest === 'interrupt/test') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      return { kind: 'json', status: 200, obj: { ok: true, pending: autoContinue.test() } };
+    }
     // 成品配置：/dsh-pet-7340/config（GET 读取合并成品 / PUT 保存用户层 / POST 同步内置默认）
     if (rest === 'config') {
       if (method === 'GET') {
@@ -2251,6 +2385,9 @@ export function apply(ctx: any): void {
         const text = currentTaskFromTodo(event as { data?: { todos?: Array<{ status?: string; content?: string }> } });
         // 缓存无条件更新：工具跑完要靠它把气泡恢复回来（见下方 tool/call 的接线）
         lastTodoText.set(sessionId, text);
+        // 「清单还有没做完的项」：currentTaskFromTodo 只在还有 in_progress/pending 时给文案，
+        // 全绿（或清单被清空）就是 null。跨回合保留——清单是任务级状态，不随回合结束清空。
+        openTodo.set(sessionId, text !== null);
         // 工具正在执行时不覆盖气泡：「修改 index.ts」比清单里那句更能说明此刻在动什么
         if ((toolsInFlight.get(sessionId) ?? 0) > 0) return;
         if (workStatus.has(sessionId)) {
@@ -2263,6 +2400,7 @@ export function apply(ctx: any): void {
         // 目标续跑轮判定：自动轮的消息带 source.kind==='goal'（round>0），该轮属自动续跑，
         // 其 turn/end completed 只是「本轮完成」，不是整个任务完成
         const source = (event as { data?: { source?: { kind?: string } } })?.data?.source;
+        autoContinue.onUserMessage(sessionId, source?.kind);
         if (source?.kind === 'goal') {
           const flags = turnFlags.get(sessionId) ?? { goalRound: false, closing: null };
           flags.goalRound = true;
@@ -2272,6 +2410,7 @@ export function apply(ctx: any): void {
       }
       if (type === 'turn/start') {
         turnFlags.set(sessionId, { goalRound: false, closing: null }); // 新一轮：清 turn 级标志
+        autoContinue.onTurnStart(sessionId);
         // 新一轮也开始新的任务上下文：清掉上一轮留下的任务详情文案（issue #59），否则它会一直挂着。
         // 代价：goal 续跑这类多轮任务，每轮开头会回落一瞬档位文案，直到本轮（通常在开头几步内）
         // 再写一次 todo 清单。
@@ -2292,6 +2431,21 @@ export function apply(ctx: any): void {
           turnFlags.set(sessionId, flags);
         }
       }
+      // 异常中断自动续跑：在 reduceWorkStatus 之前消费 turn/end——reduce 对 aborted/interrupted
+      // 返回 null，走不到后面的通用分支，但 interrupted（崩溃恢复）正是要续跑的场景之一。
+      if (type === 'turn/end' && shouldNotifySession(session)) {
+        autoContinue.setConfig(readAutoConfig());
+        // hasOpenWork：清单没清空，或有工具调用发出后没等到结果（回合断在工具执行中间）。
+        // 只有这两个信号之一成立，「completed」才可能是「说句话就停」而不是真收尾。
+        const hasOpenWork = openTodo.get(sessionId) === true || (toolsInFlight.get(sessionId) ?? 0) > 0;
+        autoContinue.onTurnEnd(
+          sessionId,
+          (event as { data?: { reason?: TurnEndReason } }).data?.reason ?? null,
+          lastTodoText.get(sessionId) ?? workStatus.taskOf(sessionId),
+          Number((event as { seq?: unknown }).seq ?? 0),
+          hasOpenWork,
+        );
+      }
       const next = reduceWorkStatus(
         event as { type?: string; data?: Record<string, unknown> & { reason?: { kind?: string } } },
         turnFlags.get(sessionId),
@@ -2303,6 +2457,7 @@ export function apply(ctx: any): void {
           turnFlags.delete(sessionId);
           cancelTerminalCleanup(sessionId); // 条目都要清了，别留一个到点后无事可做的定时器
           lastTodoText.delete(sessionId); // 按会话记的两份缓存跟着会话一起消失（防泄漏）
+          openTodo.delete(sessionId);
           toolsInFlight.delete(sessionId);
           workStatus.clear(sessionId); // 条目连同任务详情文案一起消失（clear 内部会重算展示）
           publishWorkStatus(); // 回合被打断 → 回到空闲：前端据此收起常驻气泡

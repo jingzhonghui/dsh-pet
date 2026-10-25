@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src 'self' file:;"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dsh-pet 中断确认</title>
+    <style>
+      /* 字体：与宠物头顶气泡同一套（随包发布的上首软糖体，file:// 同源加载，不依赖宿主 HTTP 端口）。
+         缺失时按字体栈回退系统字体，样式不会塌。 */
+      @font-face {
+        font-family: 'ShangshouSoftCandy';
+        src: url('../../assets/fonts/上首软糖体.ttf') format('truetype');
+        font-display: swap;
+        font-weight: 400;
+      }
+      * {
+        box-sizing: content-box;
+        margin: 0;
+        padding: 0;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        /* 窗口本体透明：可见的只有气泡本身，背景是桌面上的其它窗口 */
+        background: transparent;
+        color: #2b2b2b;
+        font-family:
+          'ShangshouSoftCandy', 'Yuanti SC', 'YouYuan', '幼圆', 'Comic Sans MS', 'PingFang SC', 'Microsoft YaHei',
+          sans-serif;
+        user-select: none;
+        -webkit-app-region: no-drag;
+      }
+      /* 透明留白：左右给投影，底部给尾巴（尾巴 8px 落在底部留白里，不会被窗口切掉）。
+         窗口尺寸 = 这里量到的（气泡 + 这圈留白），由主进程按上报值收口，短文案不会拖一个大透明框。
+         必须是块级布局、气泡不参与收缩：flex 子项会随视口收缩，导致「量出来的宽度 = 当前视口宽度」，
+         主进程按它收窗口后内容又被裁——尺寸永远收敛不到真实内容大小。 */
+      #app {
+        padding: 18px 24px 26px;
+      }
+      /* 气泡本体：与 .pet-bubble 同色同圆角同投影，等宽内容（width:max-content）+ 320px 上限，
+         超过上限才折行。出场动画沿用气泡的淡入（240ms 透明 + 轻微上移）。 */
+      .bubble {
+        position: relative;
+        width: max-content;
+        max-width: 320px;
+        /* 块级布局下水平居中；宽度由内容定，不随窗口收缩（见 #app 注释） */
+        margin: 0 auto;
+        padding: 10px 13px 11px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.94);
+        box-shadow:
+          0 4px 16px rgba(0, 0, 0, 0.14),
+          0 1px 3px rgba(0, 0, 0, 0.08);
+        font-size: 14px;
+        line-height: 1.6;
+        white-space: normal;
+        overflow-wrap: break-word;
+        opacity: 0;
+        transform: translateY(4px);
+        transition:
+          opacity 0.24s ease,
+          transform 0.24s ease;
+      }
+      .bubble.is-on {
+        opacity: 1;
+        transform: none;
+      }
+      /* 下指尾巴：与气泡同色，尖端正对宠物头顶 */
+      .bubble::after {
+        content: '';
+        position: absolute;
+        left: 50%;
+        bottom: -8px;
+        transform: translateX(-50%);
+        border: 8px solid transparent;
+        border-top-color: rgba(255, 255, 255, 0.94);
+        border-bottom: none;
+      }
+      .head {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 15px;
+        font-weight: 700;
+        color: #1f1f1f;
+        line-height: 1.45;
+      }
+      /* 告警小圆点：代替图标，不引入 emoji 字体依赖 */
+      .head::before {
+        content: '';
+        flex: none;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #e8952f;
+      }
+      .reason {
+        margin-top: 3px;
+        color: #2b2b2b;
+        display: -webkit-box;
+        -webkit-line-clamp: 4;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .task {
+        margin-top: 5px;
+        font-size: 0.78em;
+        color: rgba(43, 43, 43, 0.6);
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .task[hidden] {
+        display: none;
+      }
+      .foot {
+        margin-top: 9px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .meta {
+        flex: 1 1 auto;
+        min-width: 0;
+        font-size: 0.72em;
+        line-height: 1.4;
+        color: rgba(43, 43, 43, 0.5);
+      }
+      .actions {
+        flex: none;
+        display: flex;
+        gap: 6px;
+        margin-left: auto;
+      }
+      button {
+        -webkit-app-region: no-drag;
+        border: 0;
+        border-radius: 999px;
+        padding: 5px 13px;
+        font-size: 0.88em;
+        font-family: inherit;
+        line-height: 1.5;
+        cursor: pointer;
+        transition:
+          background 0.12s ease,
+          filter 0.12s ease;
+      }
+      button:focus-visible {
+        outline: 2px solid rgba(47, 111, 237, 0.55);
+        outline-offset: 2px;
+      }
+      #no {
+        background: rgba(43, 43, 43, 0.08);
+        color: #2b2b2b;
+      }
+      #no:hover {
+        background: rgba(43, 43, 43, 0.14);
+      }
+      #yes {
+        background: #2f6fed;
+        color: #fff;
+        font-weight: 600;
+      }
+      #yes:hover {
+        filter: brightness(1.08);
+      }
+      button:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .bubble {
+          transition: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="bubble" class="bubble" role="alertdialog" aria-live="assertive" aria-label="工作被异常中断">
+        <div class="head">工作被异常中断</div>
+        <div class="reason" id="reason">正在读取中断原因…</div>
+        <div class="task" id="task" hidden></div>
+        <div class="foot">
+          <div class="meta" id="meta"></div>
+          <div class="actions">
+            <button id="no" type="button" title="暂不继续">暂不继续</button>
+            <button id="yes" type="button" title="继续未完成的工作">继续</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var payload = null;
+        var answered = false;
+        var countdownTimer = null;
+        var deadline = 0;
+        var lastReported = '';
+
+        var appEl = document.getElementById('app');
+        var bubbleEl = document.getElementById('bubble');
+        var reasonEl = document.getElementById('reason');
+        var taskEl = document.getElementById('task');
+        var metaEl = document.getElementById('meta');
+        var yesBtn = document.getElementById('yes');
+        var noBtn = document.getElementById('no');
+
+        /**
+         * 量出「气泡 + 外留白」的整数尺寸并上报主进程。
+         *
+         * 尺寸必须由页面说了算：文案长短、折行行数都在这里定，主进程只按上报值收口窗口。
+         * 内容没变就不重复上报（倒计时每秒只改文字，量出来一样就一次 IPC 都不发）。
+         */
+        function measure() {
+          var bridge = window.interruptBridge;
+          if (!bridge || typeof bridge.measure !== 'function') return;
+          var cs = window.getComputedStyle(appEl);
+          var rect = bubbleEl.getBoundingClientRect();
+          // 取 rect 与 scroll* 的较大值：文案溢出气泡盒（行数超出、字体替换后重排）时，
+          // 只有 scroll* 会变大，rect 还是旧值——按 rect 收窗口就会把底部裁掉。
+          var w =
+            Math.max(rect.width, bubbleEl.scrollWidth) +
+            parseFloat(cs.paddingLeft || '0') +
+            parseFloat(cs.paddingRight || '0');
+          var h =
+            Math.max(rect.height, bubbleEl.scrollHeight) +
+            parseFloat(cs.paddingTop || '0') +
+            parseFloat(cs.paddingBottom || '0');
+          if (!(w > 0) || !(h > 0)) return; // 还没排版（隐藏窗口）或测量异常：等下一拍
+          var key = Math.ceil(w) + 'x' + Math.ceil(h);
+          if (key === lastReported) return;
+          lastReported = key;
+          bridge.measure({ w: Math.ceil(w), h: Math.ceil(h) });
+        }
+
+        /** 页脚倒计时：剩余秒数 + 第几次续跑（小字，与气泡的 sub 行同色）。 */
+        function renderMeta() {
+          var left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+          var attempts =
+            payload.maxAttempts > 1 ? '第 ' + payload.attempt + '/' + payload.maxAttempts + ' 次续跑 · ' : '';
+          metaEl.textContent = attempts + (left > 0 ? left + ' 秒后自动暂不继续' : '即将自动暂不继续');
+          measure();
+        }
+
+        function answer(value) {
+          if (!payload || answered) return;
+          answered = true;
+          yesBtn.disabled = true;
+          noBtn.disabled = true;
+          if (countdownTimer !== null) window.clearInterval(countdownTimer);
+          window.interruptBridge.answer(payload.id, value);
+        }
+
+        window.interruptBridge.onData(function (data) {
+          payload = data || {};
+          reasonEl.textContent = payload.reason || '服务商/网络异常导致回合中断';
+          if (payload.task) {
+            taskEl.textContent = '中断时记录的任务：' + payload.task;
+            taskEl.hidden = false;
+          } else {
+            taskEl.hidden = true;
+          }
+          var timeoutMs = Number(payload.timeoutMs);
+          deadline = Date.now() + (Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 90000);
+          renderMeta();
+          if (countdownTimer !== null) window.clearInterval(countdownTimer);
+          countdownTimer = window.setInterval(renderMeta, 1000);
+          // 先上报尺寸（主进程据此把窗口收到刚好包住气泡），下一帧再淡入：
+          // 否则会先看到一个大透明框再缩，或者气泡先出现再被窗口裁一下。
+          window.requestAnimationFrame(function () {
+            measure();
+            window.requestAnimationFrame(function () {
+              bubbleEl.classList.add('is-on');
+            });
+          });
+        });
+
+        // 窗口被主进程改大改小、或字体异步到位导致气泡重新折行后，都必须重新量一次：
+        // 否则窗口停在旧尺寸，内容就被裁掉一截。`measure` 自带去重，量出来没变不会多发 IPC。
+        window.addEventListener('resize', measure);
+        if (typeof window.ResizeObserver === 'function') {
+          new window.ResizeObserver(measure).observe(bubbleEl);
+        }
+        measure();
+
+        yesBtn.addEventListener('click', function () {
+          answer('continue');
+        });
+        noBtn.addEventListener('click', function () {
+          answer('no');
+        });
+        document.addEventListener('keydown', function (event) {
+          if (event.key === 'Enter' && !event.isComposing) answer('continue');
+          else if (event.key === 'Escape') answer('no');
+        });
+      })();
+    </script>
+  </body>
+</html>

@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: dsh-pet HTTP API
-  version: 0.3.8
+  version: 0.4.0
   summary: DSH 桌宠插件的宿主 HTTP 接口
   description: |
     dsh-pet 的宿主（host）半侧通过 DSH 的 `webServer` 服务注册**一条前缀路由** `/dsh-pet-7340`，
@@ -1698,6 +1698,80 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /dsh-pet-7340/interrupt/answer:
+    post:
+      tags: [Action]
+      operationId: answerInterrupt
+      summary: 回答「异常中断是否继续」确认
+      description: |
+        桌面常驻 Helper 的置顶确认框与网页内确认卡共用的回答入口。
+
+        两种来源都只带 `{ id, answer }`：`id` 是 `/state` 的 `sections.interrupt.data.id`
+        （测试弹框以 `test:` 开头），`answer` 为 `continue` / `no`。
+        宿主按 id 匹配当前待确认项：过期、已被别处回答或 id 不存在 → `{ ok: false, reason }`，
+        不会误续跑。回答 `continue` 后，会话还活着才真正调用 `Agent.followup`；
+        回答 `no` 只收起确认，不发任何消息。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InterruptAnswerRequest"
+      responses:
+        "200":
+          description: |
+            业务结果一律 200：`ok: true` 表示已受理；`ok: false` 的 `reason` 可能是
+            `missing-id` / `stale-or-unknown`（已被回答、已超时或从未存在）。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InterruptAnswerResponse"
+        "400":
+          description: 请求体不是合法 JSON。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/interrupt/status:
+    get:
+      tags: [State]
+      operationId: getInterruptStatus
+      summary: 读取当前待确认项与续跑配置
+      description: |
+        返回宿主内存里的待确认项（没有则 `pending: null`）与当前生效的续跑配置快照。
+        只读、不触发续跑；调试与设置页「测试弹框」用它确认链路。
+      responses:
+        "200":
+          description: 当前待确认项与配置快照。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InterruptStatusResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/interrupt/test:
+    post:
+      tags: [Action]
+      operationId: testInterruptDialog
+      summary: 弹一次测试确认框
+      description: |
+        走与真实中断完全相同的确认链路，但回答不会真的续跑：
+        桌面 Helper 可用时建置顶窗；不可用时写 `sections.interrupt`，网页端卡片立刻出现。
+        用于验证「DSH 不在前台也能弹出来」以及 Helper 是否常驻。
+      responses:
+        "200":
+          description: 测试项已创建（同时返回当前待确认项）。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InterruptTestResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
   /dsh-pet-7340/pet-display:
     post:
       tags: [Config]
@@ -2492,7 +2566,7 @@ components:
         sections:
           type: object
           description: 全局段（所有端共享一份）
-          required: [balance, workStatus, notify, config]
+          required: [balance, workStatus, notify, config, interrupt]
           properties:
             balance:
               $ref: "#/components/schemas/BalanceLeaf"
@@ -2502,6 +2576,8 @@ components:
               $ref: "#/components/schemas/NotifyLeaf"
             config:
               $ref: "#/components/schemas/ConfigLeaf"
+            interrupt:
+              $ref: "#/components/schemas/InterruptLeaf"
         pets:
           type: object
           description: 每只宠物各自一份；键是宠物 id（**可含点号，勿切分**）
@@ -2771,6 +2847,120 @@ components:
             - $ref: "#/components/schemas/NotifyFrame"
             - type: "null"
 
+    InterruptPayload:
+      type: object
+      required: [id, sessionId, kind, reason, task, via, createdAt, timeoutMs, attempt, maxAttempts]
+      description: |
+        一条待用户确认的异常中断。桌面端据此弹置顶窗，网页端在 Helper 不可用时据此渲染确认卡。
+        `via` 由宿主在拉起桌面弹框后回填：`desktop` = 已交给常驻 Helper；`web` = Helper 不可用。
+      properties:
+        id:
+          type: string
+          description: 稳定 id（`<sessionId>:<seq>`）；回答时原样带回
+        sessionId:
+          type: string
+        kind:
+          type: string
+          enum: [error, timeout, max-tokens, interrupted]
+        reason:
+          type: string
+          description: 展示给用户的一句话原因（已截断，不含堆栈）
+        task:
+          oneOf:
+            - type: string
+            - type: "null"
+          description: 中断时最近一条 todo 文案
+        via:
+          type: string
+          enum: [desktop, web]
+        createdAt:
+          type: integer
+          format: int64
+        timeoutMs:
+          type: integer
+          minimum: 0
+        attempt:
+          type: integer
+          minimum: 1
+        maxAttempts:
+          type: integer
+          minimum: 1
+        test:
+          type: boolean
+
+    InterruptLeaf:
+      type: object
+      required: [counter, data]
+      properties:
+        counter:
+          $ref: "#/components/schemas/Counter"
+        data:
+          description: |
+            当前待确认项；`null` = 没有。
+            **与其它叶子不同，消费端必须处理 `data: null`**：它表示「确认项已被回答/超时」，
+            网页端据此收起卡片（通用轮询循环默认会跳过 null 叶子）。
+          oneOf:
+            - $ref: "#/components/schemas/InterruptPayload"
+            - type: "null"
+
+    InterruptAnswerRequest:
+      type: object
+      required: [id, answer]
+      properties:
+        id:
+          type: string
+        answer:
+          type: string
+          enum: [continue, no]
+          description: continue = 继续未完成的工作；no = 暂不继续
+
+    InterruptAnswerResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        reason:
+          type: string
+          description: ok=false 时的原因（missing-id / stale-or-unknown）
+
+    InterruptConfigSnapshot:
+      type: object
+      required: [enabled, maxAttempts, delayMs, dialogTimeoutMs, allowTruncated]
+      properties:
+        enabled:
+          type: boolean
+        maxAttempts:
+          type: integer
+        delayMs:
+          type: integer
+        dialogTimeoutMs:
+          type: integer
+        allowTruncated:
+          type: boolean
+
+    InterruptStatusResponse:
+      type: object
+      required: [ok, pending, config]
+      properties:
+        ok:
+          type: boolean
+        pending:
+          oneOf:
+            - $ref: "#/components/schemas/InterruptPayload"
+            - type: "null"
+        config:
+          $ref: "#/components/schemas/InterruptConfigSnapshot"
+
+    InterruptTestResponse:
+      type: object
+      required: [ok, pending]
+      properties:
+        ok:
+          type: boolean
+        pending:
+          $ref: "#/components/schemas/InterruptPayload"
+
     ConfigLeaf:
       type: object
       required: [counter, data]
@@ -2801,6 +2991,7 @@ components:
         - $ref: "#/components/schemas/ApprovalFrame"
         - $ref: "#/components/schemas/QuestionFrame"
         - $ref: "#/components/schemas/AgentErrorFrame"
+        - $ref: "#/components/schemas/HostAutoContinueFrame"
       discriminator:
         propertyName: type
         mapping:
@@ -2808,6 +2999,7 @@ components:
           approval/requested: "#/components/schemas/ApprovalFrame"
           question/requested: "#/components/schemas/QuestionFrame"
           host/agent-error: "#/components/schemas/AgentErrorFrame"
+          host/auto-continue: "#/components/schemas/HostAutoContinueFrame"
 
     TurnEndFrame:
       type: object
@@ -2887,6 +3079,19 @@ components:
         type:
           type: string
           const: host/agent-error
+        message:
+          type: string
+
+    HostAutoContinueFrame:
+      type: object
+      required: [type, message]
+      description: |
+        自动续跑的状态反馈（已发起 / 达到次数上限 / 熔断暂停）。不是错误帧，但走同一套通知通道。
+        不带 `sessionId`：这条反馈是宿主级状态，点击只叫窗口、不跳会话。
+      properties:
+        type:
+          type: string
+          const: host/auto-continue
         message:
           type: string
 
@@ -3270,6 +3475,32 @@ components:
           type: boolean
         confineToScreen:
           type: boolean
+        trayEnabled:
+          type: boolean
+          description: 桌面模式系统托盘开关（仅桌面模式）
+        autoContinueEnabled:
+          type: boolean
+          description: |
+            异常中断自动续跑总开关。`false`（默认）= 由常驻桌面 Helper 弹置顶确认框；
+            `true` = 直接自动续跑、不弹框。两种方式互斥。
+        autoContinueOnTruncated:
+          type: boolean
+          description: 输出截断（max-tokens）是否也算「未完成」并续跑；默认 false
+        autoContinueMaxAttempts:
+          type: integer
+          minimum: 1
+          maximum: 10
+          description: 同一会话最多自动续跑次数
+        autoContinueDelayMs:
+          type: integer
+          minimum: 1000
+          maximum: 120000
+          description: 首次续跑延迟；之后按 2 倍指数退避，上限 120s
+        autoContinueDialogTimeoutMs:
+          type: integer
+          minimum: 10000
+          maximum: 600000
+          description: 确认弹框自动超时；超时按「暂不继续」处理
         chatMemoryRounds:
           type: integer
           minimum: 0
@@ -3310,6 +3541,26 @@ components:
         fixedEnabled:
           type: boolean
           description: 宠物固定（随机链不再抽「转向 / 移动」两档；主动触发不受影响）
+        autoContinueEnabled:
+          type: boolean
+          description: 异常中断自动续跑总开关（main 条目全局字段；默认 false）
+        autoContinueOnTruncated:
+          type: boolean
+        autoContinueMaxAttempts:
+          type: integer
+          minimum: 1
+          maximum: 10
+        autoContinueDelayMs:
+          type: integer
+          minimum: 1000
+          maximum: 120000
+        autoContinueDialogTimeoutMs:
+          type: integer
+          minimum: 10000
+          maximum: 600000
+        trayEnabled:
+          type: boolean
+          description: 桌面模式系统托盘开关
         display:
           type: string
           enum: [web, desktop, both, none]
@@ -3356,3 +3607,4 @@ components:
               default: 300
               description: 周期碎碎念间隔
       additionalProperties: true
+

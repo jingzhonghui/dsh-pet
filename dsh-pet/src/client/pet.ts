@@ -44,6 +44,7 @@ import {
 } from '../shared/state';
 import { WORK_STATUS_INDEX, type WorkStatusSnapshot } from '../shared/work-status';
 import { makeBalanceBubble, makeWhisperBubble } from './bubble';
+import { makeInterruptCard, type InterruptPayload } from './interrupt';
 import { clickScore, SCORE_MIN_SPEED, mountScorePopup, spawnScoreBurst } from '../shared/score-popup';
 import {
   CANVAS_H,
@@ -216,6 +217,8 @@ export function makePetUI(rt: {
   useRef: <T>(initial: T) => ReactNS.MutableRefObject<T>;
 }): () => ReactNode {
   const { h, useState, useEffect, useRef } = rt;
+  /** 异常中断确认卡：桌面 Helper 不可用时在这里兜底，回答走与桌面弹框同一个 host 路由。 */
+  const InterruptCard = makeInterruptCard({ h, useState });
   injectCss();
 
   /** 余额气泡：数据与显隐由 PetCard 传入。 */
@@ -2134,6 +2137,9 @@ export function makePetUI(rt: {
   function PetMulti() {
     const [pets, setPets] = useState<Pet[]>([]);
     const [ready, setReady] = useState(false);
+    // 异常中断待确认项（sections.interrupt）：null = 没有；桌面 Helper 已弹框时 via='desktop'，
+    // 网页端不重复展示，只在 Helper 不可用（via='web'）时出现。
+    const [interrupt, setInterrupt] = useState<InterruptPayload | null>(null);
     // 碰撞站场：每只 PetCard 注册槽位，纯 ref 同步，不触发重渲染。
     const arenaRef = useRef<{ slots: Record<string, PetCollisionSlot> }>({ slots: {} });
     // 余额状态：容器统一拉取，PetCard 共享；两个 tick 分别驱动动画与文字说明。
@@ -2263,9 +2269,18 @@ export function makePetUI(rt: {
           baseline = flattenCounters(s); // 首拉只记基线，不渲染。
           // 菜单项是当前状态而不是事件，首拉也必须装上，否则刷新后第三方菜单会一直为空。
           menuItemsRef.current = readMenuItems(s.sections.menu?.data, 'web');
+          // 待确认项也是状态：页面刷新/中途打开时如果宿主已经挂着一条，必须直接显示，
+          // 不能等到下一次 counter 变化（那可能永远不来）。
+          setInterrupt((s.sections.interrupt?.data as InterruptPayload | null) ?? null);
           return;
         }
         for (const { path, leaf } of takeChanged(s, baseline)) {
+          // sections.interrupt 的「没有待确认项」就是 data=null：必须在通用 null 跳过之前消费，
+          // 否则待确认项被回答/超时后，页面上的卡片永远收不起来。
+          if (path === 'sections.interrupt') {
+            setInterrupt((leaf.data as InterruptPayload | null) ?? null);
+            continue;
+          }
           if (leaf.data === null) continue;
           if (path === 'sections.config') {
             // 配置被别处改过（唯一写方是 POST /pet-display），重新拉取并拍平。
@@ -2364,31 +2379,41 @@ export function makePetUI(rt: {
       };
     }, [ready]);
 
+    const answerInterrupt = (id: string, yes: boolean): void => {
+      setInterrupt(null); // 乐观收起；host 下一次写真实状态会覆盖
+      void postAction('/dsh-pet-7340/interrupt/answer', { id, answer: yes ? 'continue' : 'no' });
+    };
+
     return ready
-      ? visiblePets.map((p) =>
-          h(PetCard, {
-            key: p.id,
-            cfg: p as RuntimePet,
-            balance,
-            balanceTick,
-            balanceNoticeTick,
-            balanceManual,
-            workStatus,
-            workStatusTick,
-            say: sayRef.current[p.id],
-            sayTick,
-            animCue: animCueRef.current[p.id],
-            animCueTick,
-            posCue: posCueRef.current[p.id],
-            posCueTick,
-            throwCue: throwCueRef.current[p.id],
-            throwCueTick,
-            lock: lockRef.current[p.id],
-            lockTick,
-            menuItemsRef,
-            arena: arenaRef,
-          }),
-        )
+      ? [
+          interrupt && interrupt.via === 'web'
+            ? h(InterruptCard, { key: 'interrupt', payload: interrupt, onAnswer: answerInterrupt })
+            : null,
+          ...visiblePets.map((p) =>
+            h(PetCard, {
+              key: p.id,
+              cfg: p as RuntimePet,
+              balance,
+              balanceTick,
+              balanceNoticeTick,
+              balanceManual,
+              workStatus,
+              workStatusTick,
+              say: sayRef.current[p.id],
+              sayTick,
+              animCue: animCueRef.current[p.id],
+              animCueTick,
+              posCue: posCueRef.current[p.id],
+              posCueTick,
+              throwCue: throwCueRef.current[p.id],
+              throwCueTick,
+              lock: lockRef.current[p.id],
+              lockTick,
+              menuItemsRef,
+              arena: arenaRef,
+            }),
+          ),
+        ]
       : null;
   }
 

@@ -345,6 +345,30 @@ function topFieldValid(key: string, value: unknown): boolean {
     case 'trayEnabled':
       // 桌面模式系统托盘开关（main 条目顶层；helper 读它决定建不建托盘图标）
       return typeof value === 'boolean';
+    case 'autoContinueEnabled':
+      // 异常中断自动续跑总开关（默认关闭；关闭时由桌面 Helper 弹框询问）
+      return typeof value === 'boolean';
+    case 'autoContinueOnTruncated':
+      // 输出截断（max-tokens）是否也自动续跑；默认关闭
+      return typeof value === 'boolean';
+    case 'autoContinueOnCompleted':
+      // 「正常结束但活没干完」（completed + 清单未清空/工具没返回）是否也纳入；默认开启
+      return typeof value === 'boolean';
+    case 'autoContinueMaxAttempts': {
+      // 同一会话最多续跑次数：1..10 的有限数字
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 1 && n <= 10;
+    }
+    case 'autoContinueDelayMs': {
+      // 回合结束后延迟多久再续跑（给用户一个插入新消息的窗口）：1s..120s
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 1000 && n <= 120000;
+    }
+    case 'autoContinueDialogTimeoutMs': {
+      // 确认弹框自动超时：10s..10min，超时按「暂不继续」处理
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 10000 && n <= 600000;
+    }
     case 'animations':
       return animationsValid(value);
     case 'animationWeights':
@@ -690,6 +714,19 @@ export function saveUserConfig(
   // 系统托盘开关（全局，仅桌面模式）：与上面几个全局布尔同语义——传了必须是布尔，没传走透传保留。
   const te = o.trayEnabled;
   if (te !== undefined && typeof te !== 'boolean') return null;
+  // 异常中断自动续跑：与其他全局开关同语义——传了必须是合法值，没传走透传保留。
+  const ace = o.autoContinueEnabled;
+  if (ace !== undefined && typeof ace !== 'boolean') return null;
+  const acot = o.autoContinueOnTruncated;
+  if (acot !== undefined && typeof acot !== 'boolean') return null;
+  const acoc = o.autoContinueOnCompleted;
+  if (acoc !== undefined && typeof acoc !== 'boolean') return null;
+  const acma = o.autoContinueMaxAttempts;
+  if (acma !== undefined && !topFieldValid('autoContinueMaxAttempts', acma)) return null;
+  const acd = o.autoContinueDelayMs;
+  if (acd !== undefined && !topFieldValid('autoContinueDelayMs', acd)) return null;
+  const acdt = o.autoContinueDialogTimeoutMs;
+  if (acdt !== undefined && !topFieldValid('autoContinueDialogTimeoutMs', acdt)) return null;
   // physics（拖拽抛掷手感，设置页「物理」区可图形化编辑）：整段校验——physicsValid 与读取侧
   // 是同一份规则（gravity/groundFriction ≥ 0、restitution ∈ [0,1]、throwPower > 0、两个布尔）。
   // 传了就按白名单写入；没传则走下面的透传保留（用户手改的值原样不动）。
@@ -729,6 +766,13 @@ export function saveUserConfig(
   if (cie !== undefined) outConfig.chatImageEnabled = cie;
   if (cts !== undefined) outConfig.confineToScreen = cts;
   if (te !== undefined) outConfig.trayEnabled = te;
+  if (ace !== undefined) outConfig.autoContinueEnabled = ace;
+  if (acot !== undefined) outConfig.autoContinueOnTruncated = acot;
+  if (acoc !== undefined) outConfig.autoContinueOnCompleted = acoc;
+  // 数值归一化落盘：请求体传字符串也存成数字（与读取侧 Number() 口径一致）
+  if (acma !== undefined) outConfig.autoContinueMaxAttempts = Number(acma);
+  if (acd !== undefined) outConfig.autoContinueDelayMs = Number(acd);
+  if (acdt !== undefined) outConfig.autoContinueDialogTimeoutMs = Number(acdt);
   if (ph !== undefined) outConfig.physics = ph;
   if (fo !== undefined) outConfig.font = fo;
   if (wm !== undefined) outConfig.whisperModel = cleanModel(wm as Record<string, unknown>);
@@ -747,6 +791,12 @@ export function saveUserConfig(
   if (cie !== undefined) bodyOwned.add('chatImageEnabled');
   if (cts !== undefined) bodyOwned.add('confineToScreen');
   if (te !== undefined) bodyOwned.add('trayEnabled');
+  if (ace !== undefined) bodyOwned.add('autoContinueEnabled');
+  if (acot !== undefined) bodyOwned.add('autoContinueOnTruncated');
+  if (acoc !== undefined) bodyOwned.add('autoContinueOnCompleted');
+  if (acma !== undefined) bodyOwned.add('autoContinueMaxAttempts');
+  if (acd !== undefined) bodyOwned.add('autoContinueDelayMs');
+  if (acdt !== undefined) bodyOwned.add('autoContinueDialogTimeoutMs');
   if (ph !== undefined) bodyOwned.add('physics');
   if (fo !== undefined) bodyOwned.add('font');
   if (wm !== undefined) bodyOwned.add('whisperModel');

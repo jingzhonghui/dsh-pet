@@ -262,6 +262,15 @@ export const zh = {
   trayToggle: '系统托盘',
   trayToggleHint:
     '桌面模式启动后在通知区域（macOS 为菜单栏）常驻一个图标，列出配置里的全部宠物，勾选就能切换显示位置——包括当前不在桌面、没有窗口可右键的那些。关掉之后要把宠物叫回桌面，只能开浏览器用设置页，或在网页端那只宠物身上右键。Windows 本来就会把它折叠进「隐藏的图标」面板。仅影响桌面模式。',
+  autoContinueToggle: '异常中断自动续跑',
+  autoContinueToggleHint:
+    '服务商/网络异常导致回合中断、且工作可能未完成时：关闭（默认）由常驻桌面 Helper 弹出置顶确认框，点「继续」才续跑；开启则直接自动续跑、不再弹框。只对 429 / 5xx / 超时 / 连接重置等可重试中断生效，认证失败、请求非法、内容过滤不续。网页端在 Helper 不可用时回退为页面内确认卡。',
+  autoContinueOnCompletedToggle: '清单没干完也算中断',
+  autoContinueOnCompletedToggleHint:
+    '回合「正常结束」但任务清单里还有 in_progress/pending 项、或有工具调出去没等到结果时，也按「没干完」处理，走上一条的弹框 / 自动续跑。DSH 对「模型说完一句话就停」和「真收尾」都报 completed，只能靠清单状态和未返回的工具调用分辨；这两样都没有时不会触发，否则每条回复都会弹一次。',
+  autoContinueTest: '测试中断弹框',
+  autoContinueTestOk: '测试已发送：桌面 Helper 可用时弹窗，否则出现页面内确认卡。',
+  autoContinueTestErr: '测试发送失败，请检查服务连接。',
   physicsTitle: '物理（拖拽抛掷手感）',
   physicsHint:
     '全局默认，所有宠物共用（pet pack 可在自己种类文件里单独覆盖）；随「保存」写入用户配置（不做即时写入）。浏览器保存后即时生效，桌面端由保存重载宠物窗口后生效。',
@@ -456,6 +465,15 @@ export const en = {
   trayToggle: 'System tray',
   trayToggleHint:
     'Shows a tray icon (notification area on Windows, menu bar on macOS) once desktop mode is running. It lists every pet in the config and toggles each one between desktop and web/none — including pets that are currently off the desktop and therefore have no window to right-click. With it off, bringing a pet back to the desktop requires opening the browser (the settings page, or right-clicking a web pet there). Windows already folds third-party icons into the "hidden icons" overflow. Desktop mode only.',
+  autoContinueToggle: 'Auto-continue after interruptions',
+  autoContinueToggleHint:
+    'When the provider/network breaks a turn and work may be unfinished: off (default) makes the resident desktop Helper show an always-on-top confirmation; only "Continue" resumes. On resumes automatically without a dialog. Applies only to retryable interruptions (429 / 5xx / timeout / connection reset); auth failures, invalid requests and content filters are never resumed. The web UI falls back to an in-page confirmation card when the Helper is unavailable.',
+  autoContinueOnCompletedToggle: 'Treat unfinished checklists as interrupted',
+  autoContinueOnCompletedToggleHint:
+    'When a turn ends "normally" but the task checklist still has in_progress/pending items, or a tool call went out and never returned, treat it as unfinished and apply the same dialog / auto-continue rule as above. DSH reports both "the model stopped after one sentence" and "genuinely done" as completed, so the checklist state and dangling tool calls are the only signals; with neither, nothing fires — otherwise every reply would pop a dialog.',
+  autoContinueTest: 'Test interrupt dialog',
+  autoContinueTestOk: 'Test sent: a desktop dialog appears when the Helper is available, otherwise an in-page card.',
+  autoContinueTestErr: 'Failed to send the test. Check the server connection.',
   physicsTitle: 'Physics (drag & throw feel)',
   physicsHint:
     'Global default, shared by every pet (a pet pack may override it in its own kind file); written to the user config on "Save" (never written immediately). Applies instantly in the browser; on the desktop it applies once Save reloads the pet windows.',
@@ -974,6 +992,13 @@ export function makePetConfigSection(rt: {
     const [confineScreen, setConfineScreen] = useState(false);
     // 系统托盘开关（全局）：随「保存」一起提交；宿主半侧据此决定建不建托盘、没桌面宠物时还值不值得常驻 Helper。
     const [trayEnabled, setTrayEnabled] = useState(true);
+    // 异常中断自动续跑（全局）：默认关闭——关闭时由桌面 Helper 弹框确认，开启后直接续跑、不弹框。
+    const [autoContinue, setAutoContinue] = useState(false);
+    // 「completed 也算没干完」：默认开——DSH 分不出「说句话就停」和「真收尾」，
+    // 只靠清单未清空 / 工具没返回这两个信号兜，关掉就退回「只有真报错才触发」。
+    const [autoContinueOnCompleted, setAutoContinueOnCompleted] = useState(true);
+    /** 「测试中断弹框」的就地反馈（成功/失败），与保存反馈分离。 */
+    const [autoContinueMsg, setAutoContinueMsg] = useState('');
     // 物理参数（全局）：只改本地状态，随「保存」整包写入；初值仅占位，成品加载成功后才允许编辑与保存。
     const [physics, setPhysics] = useState<PhysicsParams>({ ...DEFAULT_PHYSICS });
     // 字体（全局默认）：与 physics 同一套语义；初值仅占位，成品加载成功后才允许编辑与保存。
@@ -1007,6 +1032,9 @@ export function makePetConfigSection(rt: {
       if (typeof m.chatImageEnabled === 'boolean') setChatImage(m.chatImageEnabled);
       if (typeof m.confineToScreen === 'boolean') setConfineScreen(m.confineToScreen);
       if (typeof m.trayEnabled === 'boolean') setTrayEnabled(m.trayEnabled);
+      if (typeof m.autoContinueEnabled === 'boolean') setAutoContinue(m.autoContinueEnabled);
+      // 老配置里没有这个键 → 读不到就保持初值 true，和宿主侧 readAutoConfig 的默认口径一致。
+      if (typeof m.autoContinueOnCompleted === 'boolean') setAutoContinueOnCompleted(m.autoContinueOnCompleted);
       // physics 段：成品已按「内置默认 ← 用户层」整段填满，直接取用（缺子键再用默认兜底一次）
       if (m.physics && typeof m.physics === 'object') {
         setPhysics({ ...DEFAULT_PHYSICS, ...(m.physics as PhysicsParams) });
@@ -1111,6 +1139,20 @@ export function makePetConfigSection(rt: {
       setPermMsg({ kind: 'ok', text: t('notifyTestOk') });
     };
 
+    /**
+     * 「测试中断弹框」：走宿主同一个 /interrupt/test。桌面 Helper 可用时由它建窗，否则宿主写
+     * sections.interrupt，网页端确认卡会立刻出现——两条路径都不需要真实中断事件。
+     */
+    const testInterrupt = async () => {
+      setAutoContinueMsg('');
+      try {
+        const r = await fetch('/dsh-pet-7340/interrupt/test', { method: 'POST' });
+        setAutoContinueMsg(r.ok ? t('autoContinueTestOk') : t('autoContinueTestErr'));
+      } catch {
+        setAutoContinueMsg(t('autoContinueTestErr'));
+      }
+    };
+
     // 当前选中的宠物对象（表单数据源）；selId 由 add/remove/sync 同步维护，列表非空时恒有效
     const cur = pets.find((p) => p.id === selId) ?? null;
 
@@ -1197,6 +1239,8 @@ export function makePetConfigSection(rt: {
           chatImageEnabled: chatImage,
           confineToScreen: confineScreen,
           trayEnabled: trayEnabled,
+          autoContinueEnabled: autoContinue,
+          autoContinueOnCompleted: autoContinueOnCompleted,
           physics: physics,
           whisperModel: whisperModel,
           chatModel: chatModel,
@@ -1626,6 +1670,30 @@ export function makePetConfigSection(rt: {
                 toggleCell('chatImageToggle', chatImage, busy, setChatImage),
                 toggleCell('confineToggle', confineScreen, busy, setConfineScreen, true),
                 toggleCell('trayToggle', trayEnabled, busy, setTrayEnabled),
+                toggleCell('autoContinueToggle', autoContinue, busy, setAutoContinue),
+                toggleCell('autoContinueOnCompletedToggle', autoContinueOnCompleted, busy, setAutoContinueOnCompleted),
+              ],
+            }),
+            h('p', {
+              className: 'dsh-pet-cfg__note',
+              style: { marginTop: '8px', marginBottom: 0 },
+              children: t('autoContinueToggleHint'),
+            }),
+            h('p', {
+              className: 'dsh-pet-cfg__note',
+              style: { marginTop: '6px', marginBottom: 0 },
+              children: t('autoContinueOnCompletedToggleHint'),
+            }),
+            h('div', {
+              style: { marginTop: '10px', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' },
+              children: [
+                h('button', {
+                  className: 'dsh-pet-cfg__btn',
+                  disabled: busy,
+                  onClick: () => void testInterrupt(),
+                  children: t('autoContinueTest'),
+                }),
+                autoContinueMsg ? h('span', { className: 'dsh-pet-cfg__note', children: autoContinueMsg }) : null,
               ],
             }),
           ],

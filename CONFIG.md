@@ -44,6 +44,11 @@ DSH 设置 → 「桌宠配置」：
 | `animationWeights`     | 动画链播放权重（idle / turn / move）                                                    | 同 `animationWeights` 结构 |
 | `eventsRefreshSec`     | 事件刷新周期（秒）                                                                      | 同 `eventsRefreshSec` 结构 |
 | `notificationsEnabled` | 系统通知总开关（布尔）                                                                  | 同 `notificationsEnabled`  |
+| `autoContinueEnabled`  | 异常中断自动续跑总开关（布尔，默认 false）；关闭时由桌面 Helper 弹框确认                | 同 `autoContinueEnabled`   |
+| `autoContinueMaxAttempts` | 同一会话最多续跑次数（1–10，默认 3）                                                 | 数字                       |
+| `autoContinueDelayMs`  | 首次续跑延迟（1000–120000ms，默认 5000），之后按 2 倍退避、上限 120s                 | 数字                       |
+| `autoContinueDialogTimeoutMs` | 确认弹框自动超时（10000–600000ms，默认 90000）                                   | 数字                       |
+| `autoContinueOnTruncated` | 输出截断（max-tokens）是否也续跑（布尔，默认 false）                                 | 布尔                       |
 
 > 覆盖语义：用户层给出即**整体替换**该字段（如写了 `animations` 就用你的整份动画池，替代默认），没写的字段回落包内默认。校验在插件加载时执行——格式错误会在 DSH 控制台显式报错，不会静默运行残缺配置。
 
